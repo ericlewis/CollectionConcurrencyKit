@@ -36,12 +36,14 @@ public extension Sequence {
     /// - parameter operation: The closure to run for each element.
     func concurrentForEach(
         withPriority priority: TaskPriority? = nil,
-        _ operation: @escaping (Element) async -> Void
+        _ operation: (Element) async -> Void
     ) async {
-        await withTaskGroup(of: Void.self) { group in
-            for element in self {
-                group.addTask(priority: priority) {
-                    await operation(element)
+        await withoutActuallyEscaping(operation) { escapableOperation in
+            await withTaskGroup(of: Void.self) { group in
+                for element in self {
+                    group.addTask(priority: priority) {
+                        await escapableOperation(element)
+                    }
                 }
             }
         }
@@ -62,17 +64,19 @@ public extension Sequence {
     /// - throws: Rethrows any error thrown by the passed closure.
     func concurrentForEach(
         withPriority priority: TaskPriority? = nil,
-        _ operation: @escaping (Element) async throws -> Void
+        _ operation: (Element) async throws -> Void
     ) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for element in self {
-                group.addTask(priority: priority) {
-                    try await operation(element)
+        try await withoutActuallyEscaping(operation) { escapableOperation in
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for element in self {
+                    group.addTask(priority: priority) {
+                        try await escapableOperation(element)
+                    }
                 }
+                
+                // Propagate any errors thrown by the group's tasks:
+                for try await _ in group {}
             }
-
-            // Propagate any errors thrown by the group's tasks:
-            for try await _ in group {}
         }
     }
 }
@@ -119,16 +123,25 @@ public extension Sequence {
     ///   the transformed values will match the original sequence.
     func concurrentMap<T>(
         withPriority priority: TaskPriority? = nil,
-        _ transform: @escaping (Element) async -> T
+        _ transform: (Element) async -> T
     ) async -> [T] {
-        let tasks = map { element in
-            Task(priority: priority) {
-                await transform(element)
+        await withoutActuallyEscaping(transform) { escapableTransform in
+            await withTaskGroup(of: (offset: Int, value: T).self) { group in
+                var c = 0
+                for element in self {
+                    let idx = c
+                    c += 1
+                    group.addTask(priority: priority) {
+                        return await (idx, escapableTransform(element))
+                    }
+                }
+                
+                var res = Array<T?>(repeating: nil, count: c)
+                while let next = await group.next() {
+                    res[next.offset] = next.value
+                }
+                return res as! [T]
             }
-        }
-
-        return await tasks.asyncMap { task in
-            await task.value
         }
     }
 
@@ -150,16 +163,25 @@ public extension Sequence {
     /// - throws: Rethrows any error thrown by the passed closure.
     func concurrentMap<T>(
         withPriority priority: TaskPriority? = nil,
-        _ transform: @escaping (Element) async throws -> T
+        _ transform: (Element) async throws -> T
     ) async throws -> [T] {
-        let tasks = map { element in
-            Task(priority: priority) {
-                try await transform(element)
+        try await withoutActuallyEscaping(transform) { escapableTransform in
+            try await withThrowingTaskGroup(of: (offset: Int, value: T).self) { group in
+                var c = 0
+                for element in self {
+                    let idx = c
+                    c += 1
+                    group.addTask(priority: priority) {
+                        return try await (idx, escapableTransform(element))
+                    }
+                }
+                
+                var res = Array<T?>(repeating: nil, count: c)
+                while let next = try await group.next() {
+                    res[next.offset] = next.value
+                }
+                return res as! [T]
             }
-        }
-
-        return try await tasks.asyncMap { task in
-            try await task.value
         }
     }
 }
@@ -214,16 +236,25 @@ public extension Sequence {
     ///   except for the values that were transformed into `nil`.
     func concurrentCompactMap<T>(
         withPriority priority: TaskPriority? = nil,
-        _ transform: @escaping (Element) async -> T?
+        _ transform: (Element) async -> T?
     ) async -> [T] {
-        let tasks = map { element in
-            Task(priority: priority) {
-                await transform(element)
+        await withoutActuallyEscaping(transform) { escapableTransform in
+            await withTaskGroup(of: (offset: Int, value: T?).self) { group in
+                var c = 0
+                for element in self {
+                    let idx = c
+                    c += 1
+                    group.addTask(priority: priority) {
+                        return await (idx, escapableTransform(element))
+                    }
+                }
+                
+                var res = Array<T??>(repeating: nil, count: c)
+                while let next = await group.next() {
+                    res[next.offset] = next.value
+                }
+                return (res as! [T?]).compactMap{ $0 }
             }
-        }
-
-        return await tasks.asyncCompactMap { task in
-            await task.value
         }
     }
 
@@ -247,16 +278,25 @@ public extension Sequence {
     /// - throws: Rethrows any error thrown by the passed closure.
     func concurrentCompactMap<T>(
         withPriority priority: TaskPriority? = nil,
-        _ transform: @escaping (Element) async throws -> T?
+        _ transform: (Element) async throws -> T?
     ) async throws -> [T] {
-        let tasks = map { element in
-            Task(priority: priority) {
-                try await transform(element)
+        try await withoutActuallyEscaping(transform) { escapableTransform in
+            try await withThrowingTaskGroup(of: (offset: Int, value: T?).self) { group in
+                var c = 0
+                for element in self {
+                    let idx = c
+                    c += 1
+                    group.addTask(priority: priority) {
+                        return try await (idx, escapableTransform(element))
+                    }
+                }
+                
+                var res = Array<T??>(repeating: nil, count: c)
+                while let next = try await group.next() {
+                    res[next.offset] = next.value
+                }
+                return (res as! [T?]).compactMap{ $0 }
             }
-        }
-
-        return try await tasks.asyncCompactMap { task in
-            try await task.value
         }
     }
 }
@@ -309,16 +349,25 @@ public extension Sequence {
     ///   within the returned array.
     func concurrentFlatMap<T: Sequence>(
         withPriority priority: TaskPriority? = nil,
-        _ transform: @escaping (Element) async -> T
+        _ transform: (Element) async -> T
     ) async -> [T.Element] {
-        let tasks = map { element in
-            Task(priority: priority) {
-                await transform(element)
+        await withoutActuallyEscaping(transform) { escapableTransform in
+            await withTaskGroup(of: (offset: Int, value: T).self) { group in
+                var c = 0
+                for element in self {
+                    let idx = c
+                    c += 1
+                    group.addTask(priority: priority) {
+                        return await (idx, escapableTransform(element))
+                    }
+                }
+                
+                var res = Array<T?>(repeating: nil, count: c)
+                while let next = await group.next() {
+                    res[next.offset] = next.value
+                }
+                return (res as! [T]).flatMap{ $0 }
             }
-        }
-
-        return await tasks.asyncFlatMap { task in
-            await task.value
         }
     }
 
@@ -343,16 +392,25 @@ public extension Sequence {
     /// - throws: Rethrows any error thrown by the passed closure.
     func concurrentFlatMap<T: Sequence>(
         withPriority priority: TaskPriority? = nil,
-        _ transform: @escaping (Element) async throws -> T
+        _ transform: (Element) async throws -> T
     ) async throws -> [T.Element] {
-        let tasks = map { element in
-            Task(priority: priority) {
-                try await transform(element)
+        try await withoutActuallyEscaping(transform) { escapableTransform in
+            try await withThrowingTaskGroup(of: (offset: Int, value: T).self) { group in
+                var c = 0
+                for element in self {
+                    let idx = c
+                    c += 1
+                    group.addTask(priority: priority) {
+                        return try await (idx, escapableTransform(element))
+                    }
+                }
+                
+                var res = Array<T?>(repeating: nil, count: c)
+                while let next = try await group.next() {
+                    res[next.offset] = next.value
+                }
+                return (res as! [T]).flatMap{ $0 }
             }
-        }
-
-        return try await tasks.asyncFlatMap { task in
-            try await task.value
         }
     }
 }
